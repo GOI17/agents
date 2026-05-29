@@ -33,5 +33,7 @@
       "type": "local"
     }
   },
-  "plugin": []
+  "plugin": [
+    "opencode-subagent-statusline"
+  ]
 }
