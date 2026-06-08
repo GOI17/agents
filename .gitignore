@@ -1,1 +1,9 @@
 .atl
+environments.local/
+**/environments.local/
+profiles.local/
+**/profiles.local/
+**/profiles.local/**/.env
+**/profiles.local/**/.env.*
+**/.env
+**/.env.*
