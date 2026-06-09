@@ -14,6 +14,13 @@ assert_file_missing() {
 	[ ! -e "$path" ] || { echo "Expected file to be missing: $path" >&2; exit 1; }
 }
 
+assert_symlink_target() {
+	local path="$1" expected="$2" actual
+	[ -L "$path" ] || { echo "Expected symlink: $path" >&2; exit 1; }
+	actual="$(readlink "$path")"
+	[ "$actual" = "$expected" ] || { echo "Expected $path to point at $expected, got $actual" >&2; exit 1; }
+}
+
 assert_file_contains() {
 	local path="$1"
 	local expected="$2"
@@ -35,6 +42,7 @@ assert_text_not_contains() {
 new_fixture() {
 	local fixture
 	fixture="$(mktemp -d "${TMPDIR:-/tmp}/agents-setup.XXXXXX")"
+	fixture="$(cd "$fixture" && pwd)"
 	mkdir -p "$fixture/home/.config"
 	cp "$ROOT_DIR/setup.sh" "$fixture/setup.sh"
 	cp -R "$ROOT_DIR/opencode" "$fixture/opencode"
@@ -393,6 +401,170 @@ test_legacy_tracked_profile_materializes_canonical_storage() {
 	assert_file_contains "$fixture/home/.config/opencode/opencode.jsonc" '"legacy-tracked"'
 }
 
+test_switch_seeds_local_profile_and_symlinks_machine_config() {
+	local fixture local_profile
+	fixture="$(new_fixture)"
+	mkdir -p "$fixture/opencode/profiles/consultancy/opencode"
+	cat >"$fixture/opencode/profiles/consultancy/opencode/opencode.jsonc" <<'EOF'
+{
+  "plugin": ["consultancy"]
+}
+EOF
+	local_profile="$fixture/opencode/profiles.local/consultancy/opencode"
+	run_setup "$fixture" switch --profile consultancy --agent opencode >/dev/null
+	assert_file_exists "$local_profile/opencode.jsonc"
+	assert_file_contains "$local_profile/opencode.jsonc" '"consultancy"'
+	assert_symlink_target "$fixture/home/.config/opencode" "$local_profile"
+}
+
+test_switch_repoints_existing_profile_symlink() {
+	local fixture personal_profile consultancy_profile
+	fixture="$(new_fixture)"
+	mkdir -p "$fixture/opencode/profiles/personal/opencode"
+	mkdir -p "$fixture/opencode/profiles/consultancy/opencode"
+	printf '{"plugin":["personal"]}\n' >"$fixture/opencode/profiles/personal/opencode/opencode.jsonc"
+	printf '{"plugin":["consultancy"]}\n' >"$fixture/opencode/profiles/consultancy/opencode/opencode.jsonc"
+	personal_profile="$fixture/opencode/profiles.local/personal/opencode"
+	consultancy_profile="$fixture/opencode/profiles.local/consultancy/opencode"
+	run_setup "$fixture" switch --profile personal --agent opencode >/dev/null
+	assert_symlink_target "$fixture/home/.config/opencode" "$personal_profile"
+	run_setup "$fixture" switch --profile consultancy --agent opencode >/dev/null
+	assert_symlink_target "$fixture/home/.config/opencode" "$consultancy_profile"
+}
+
+test_switch_machine_config_edits_affect_local_profile() {
+	local fixture local_profile
+	fixture="$(new_fixture)"
+	mkdir -p "$fixture/opencode/profiles/personal/opencode"
+	printf '{"plugin":["personal"]}\n' >"$fixture/opencode/profiles/personal/opencode/opencode.jsonc"
+	local_profile="$fixture/opencode/profiles.local/personal/opencode"
+	run_setup "$fixture" switch --profile personal --agent opencode >/dev/null
+	printf 'via-symlink\n' >"$fixture/home/.config/opencode/runtime.txt"
+	assert_file_contains "$local_profile/runtime.txt" 'via-symlink'
+}
+
+test_switch_blocks_existing_non_symlink_machine_config() {
+	local fixture output
+	fixture="$(new_fixture)"
+	mkdir -p "$fixture/opencode/profiles/personal/opencode"
+	printf '{"plugin":["personal"]}\n' >"$fixture/opencode/profiles/personal/opencode/opencode.jsonc"
+	mkdir -p "$fixture/home/.config/opencode"
+	printf 'existing\n' >"$fixture/home/.config/opencode/existing.txt"
+	if output="$(run_setup "$fixture" switch --profile personal --agent opencode 2>&1)"; then
+		echo "Expected switch to fail closed for existing non-symlink config" >&2
+		exit 1
+	fi
+	printf '%s' "$output" | grep -F "Refusing to replace existing machine config" >/dev/null
+	assert_file_exists "$fixture/home/.config/opencode/existing.txt"
+	[ ! -L "$fixture/home/.config/opencode" ] || { echo "Expected machine config to remain a directory" >&2; exit 1; }
+}
+
+test_switch_blocks_tracked_profile_literal_secret() {
+	local fixture output
+	fixture="$(new_fixture)"
+	mkdir -p "$fixture/opencode/profiles/work/opencode"
+	cat >"$fixture/opencode/profiles/work/opencode/opencode.jsonc" <<'EOF'
+{
+  "mcp": {
+    "demo": {
+      "headers": {
+        "Authorization": "Bearer sk-1234567890abcdef123456"
+      }
+    }
+  }
+}
+EOF
+	if output="$(run_setup "$fixture" switch --profile work --agent opencode 2>&1)"; then
+		echo "Expected switch to block tracked profile secret" >&2
+		exit 1
+	fi
+	printf '%s' "$output" | grep -F "Secret candidates found" >/dev/null
+	assert_text_not_contains "$output" 'sk-1234567890abcdef123456'
+	assert_file_missing "$fixture/opencode/profiles.local/work"
+	assert_file_missing "$fixture/home/.config/opencode"
+}
+
+test_switch_allows_tracked_profile_env_placeholder() {
+	local fixture local_profile
+	fixture="$(new_fixture)"
+	mkdir -p "$fixture/opencode/profiles/work/opencode"
+	cat >"$fixture/opencode/profiles/work/opencode/opencode.jsonc" <<'EOF'
+{
+  "mcp": {
+    "demo": {
+      "headers": {
+        "Authorization": "Bearer ${DEMO_TOKEN}"
+      }
+    }
+  }
+}
+EOF
+	local_profile="$fixture/opencode/profiles.local/work/opencode"
+	run_setup "$fixture" switch --profile work --agent opencode >/dev/null
+	assert_file_contains "$local_profile/opencode.jsonc" 'Bearer ${DEMO_TOKEN}'
+	assert_symlink_target "$fixture/home/.config/opencode" "$local_profile"
+}
+
+test_switch_legacy_tracked_profile_materializes_before_activation() {
+	local fixture local_profile
+	fixture="$(new_fixture)"
+	write_tracked_legacy_profile "$fixture"
+	local_profile="$fixture/opencode/profiles.local/personal/opencode"
+	run_setup "$fixture" switch --profile personal --agent opencode >/dev/null
+	assert_file_exists "$fixture/opencode/profiles/personal/opencode/opencode.jsonc"
+	assert_file_contains "$fixture/opencode/profiles/personal/opencode/opencode.jsonc" '"legacy-tracked"'
+	assert_file_contains "$local_profile/opencode.jsonc" '"legacy-tracked"'
+	assert_symlink_target "$fixture/home/.config/opencode" "$local_profile"
+}
+
+test_switch_mixed_legacy_tracked_base_and_local_overlay_activation() {
+	local fixture local_profile
+	fixture="$(new_fixture)"
+	mkdir -p "$fixture/opencode/environments/personal/opencode"
+	mkdir -p "$fixture/opencode/environments.local/personal/opencode"
+	cat >"$fixture/opencode/environments/personal/opencode/opencode.jsonc" <<'EOF'
+{
+  "enabled_providers": ["github-copilot"],
+  "plugin": ["legacy-tracked"],
+  "settings": {
+    "demo": {
+      "base": "1",
+      "override": "base"
+    }
+  }
+}
+EOF
+	cat >"$fixture/opencode/environments.local/personal/opencode/opencode.jsonc" <<'EOF'
+{
+  "plugin": ["legacy-local"],
+  "settings": {
+    "demo": {
+      "override": "local",
+      "local": "2"
+    }
+  }
+}
+EOF
+	printf 'base-notes\n' >"$fixture/opencode/environments/personal/opencode/base.txt"
+	printf 'local-notes\n' >"$fixture/opencode/environments.local/personal/opencode/local.txt"
+	local_profile="$fixture/opencode/profiles.local/personal/opencode"
+
+	run_setup "$fixture" switch --profile personal --agent opencode >/dev/null
+
+	assert_symlink_target "$fixture/home/.config/opencode" "$local_profile"
+	assert_file_contains "$local_profile/opencode.jsonc" '"enabled_providers": ['
+	assert_file_contains "$local_profile/opencode.jsonc" '"github-copilot"'
+	assert_file_contains "$local_profile/opencode.jsonc" '"plugin": ['
+	assert_file_contains "$local_profile/opencode.jsonc" '"legacy-local"'
+	assert_file_contains "$local_profile/opencode.jsonc" '"base": "1"'
+	assert_file_contains "$local_profile/opencode.jsonc" '"override": "local"'
+	assert_file_contains "$local_profile/opencode.jsonc" '"local": "2"'
+	assert_file_contains "$fixture/home/.config/opencode/opencode.jsonc" '"base": "1"'
+	assert_file_contains "$fixture/home/.config/opencode/opencode.jsonc" '"override": "local"'
+	assert_file_contains "$local_profile/base.txt" 'base-notes'
+	assert_file_contains "$local_profile/local.txt" 'local-notes'
+}
+
 test_missing_profile_accept_bootstraps
 test_missing_profile_decline_leaves_no_changes
 test_granular_profile_sync
@@ -408,5 +580,13 @@ test_granular_jsonc_merge_combines_canonical_and_legacy_layers
 test_whole_profile_jsonc_merge_combines_canonical_and_legacy_layers
 test_legacy_local_only_profile_sync_works
 test_legacy_tracked_profile_materializes_canonical_storage
+test_switch_seeds_local_profile_and_symlinks_machine_config
+test_switch_repoints_existing_profile_symlink
+test_switch_machine_config_edits_affect_local_profile
+test_switch_blocks_existing_non_symlink_machine_config
+test_switch_blocks_tracked_profile_literal_secret
+test_switch_allows_tracked_profile_env_placeholder
+test_switch_legacy_tracked_profile_materializes_before_activation
+test_switch_mixed_legacy_tracked_base_and_local_overlay_activation
 
 echo "setup.sh integration tests passed."

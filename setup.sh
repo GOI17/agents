@@ -8,6 +8,8 @@ Usage:
   ./setup.sh                         Sync every agent config directory to ~/.config
   ./setup.sh <agent>                 Sync one agent config directory, e.g. ./setup.sh opencode
   ./setup.sh <agent> <path>          Sync one file or directory inside an agent config
+  ./setup.sh switch --profile <profile> --agent <agent>
+                                      Activate a profile by symlinking ~/.config/<agent>
   ./setup.sh --env <profile>         Sync one profile-first agent config
   ./setup.sh --env <profile> <agent> Sync one agent profile
   ./setup.sh --env <profile> <agent> <path>
@@ -42,6 +44,8 @@ PROFILE_LOCAL_DIR_NAME="profiles.local"
 LEGACY_ENV_DIR_NAME="environments"
 LEGACY_LOCAL_ENV_DIR_NAME="environments.local"
 LIST_ENVIRONMENTS=false
+SWITCH_PROFILE=false
+SWITCH_AGENT=""
 TEMP_FILES=()
 
 cleanup_temp_files() {
@@ -57,10 +61,32 @@ trap cleanup_temp_files EXIT
 POSITIONAL_ARGS=()
 while [ "$#" -gt 0 ]; do
 	case "$1" in
+		switch)
+			SWITCH_PROFILE=true
+			shift
+			;;
 		-e|--env)
 			[ "$#" -ge 2 ] || { echo "Missing environment name after $1" >&2; exit 1; }
 			ENVIRONMENT="$2"
 			shift 2
+			;;
+		--profile)
+			[ "$#" -ge 2 ] || { echo "Missing profile name after $1" >&2; exit 1; }
+			ENVIRONMENT="$2"
+			shift 2
+			;;
+		--profile=*)
+			ENVIRONMENT="${1#--profile=}"
+			shift
+			;;
+		--agent)
+			[ "$#" -ge 2 ] || { echo "Missing agent name after $1" >&2; exit 1; }
+			SWITCH_AGENT="$2"
+			shift 2
+			;;
+		--agent=*)
+			SWITCH_AGENT="${1#--agent=}"
+			shift
 			;;
 		--env=*)
 			ENVIRONMENT="${1#--env=}"
@@ -93,11 +119,20 @@ while [ "$#" -gt 0 ]; do
 	esac
 done
 
-set -- "${POSITIONAL_ARGS[@]}"
+if [ "${#POSITIONAL_ARGS[@]}" -gt 0 ]; then
+	set -- "${POSITIONAL_ARGS[@]}"
+else
+	set --
+fi
 
 mkdir -p "$CONFIG_DIR"
 
 if [ "$#" -gt 2 ]; then
+	usage
+	exit 1
+fi
+
+if [ "$SWITCH_PROFILE" = true ] && { [ "$#" -gt 0 ] || [ -z "$ENVIRONMENT" ] || [ -z "$SWITCH_AGENT" ]; }; then
 	usage
 	exit 1
 fi
@@ -108,6 +143,17 @@ validate_profile_name() {
 	case "$NAME" in
 		/*|*..*|*/*|*\\*)
 			echo "Profile name must be a simple directory name: $NAME" >&2
+			exit 1
+			;;
+	esac
+}
+
+validate_agent_name() {
+	local NAME="$1"
+	[ -n "$NAME" ] || { echo "Agent name cannot be empty." >&2; exit 1; }
+	case "$NAME" in
+		/*|*..*|*/*|*\\*)
+			echo "Agent name must be a simple directory name: $NAME" >&2
 			exit 1
 			;;
 	esac
@@ -578,6 +624,39 @@ bootstrap_profile_from_global() {
 	bootstrap_profile_copy_allowlist "$AGENT_NAME" "$PROFILE_NAME"
 }
 
+seed_local_profile_from_base() {
+	local BASE_DIR="$1" LOCAL_DIR="$2"
+	[ -d "$BASE_DIR" ] || { echo "Missing local profile source: $BASE_DIR" >&2; return 1; }
+	mkdir -p "$LOCAL_DIR"
+	python3 - "$BASE_DIR" "$LOCAL_DIR" <<'PY'
+import shutil
+import sys
+from pathlib import Path
+
+base_dir = Path(sys.argv[1])
+local_dir = Path(sys.argv[2])
+
+for source in sorted(base_dir.rglob('*')):
+    relative_path = source.relative_to(base_dir)
+    target = local_dir / relative_path
+    if target.exists() or target.is_symlink():
+        continue
+    if source.is_dir():
+        target.mkdir(parents=True, exist_ok=True)
+    elif source.is_symlink():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.symlink_to(source.readlink())
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+PY
+	for RELATIVE_PATH in opencode.json opencode.jsonc; do
+		if [ -e "$BASE_DIR/$RELATIVE_PATH" ] && [ -e "$LOCAL_DIR/$RELATIVE_PATH" ]; then
+			merge_json_config_file "$BASE_DIR/$RELATIVE_PATH" "$LOCAL_DIR/$RELATIVE_PATH" "$LOCAL_DIR/$RELATIVE_PATH"
+		fi
+	done
+}
+
 materialize_legacy_profile_source() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2" SOURCE_DIR DEST_DIR
 	for SOURCE_DIR in "$(legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" "$(legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"; do
@@ -609,6 +688,51 @@ ensure_profile_exists() {
 			return 1
 			;;
 	esac
+}
+
+ensure_switch_local_profile() {
+	local AGENT_NAME="$1" PROFILE_NAME="$2" CANONICAL_DIR LOCAL_DIR LEGACY_TRACKED_DIR
+	CANONICAL_DIR="$(canonical_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
+	LOCAL_DIR="$(local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
+	LEGACY_TRACKED_DIR="$(legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
+
+	[ -d "$SCRIPT_PATH/$AGENT_NAME" ] || { echo "Missing agent config directory: $SCRIPT_PATH/$AGENT_NAME" >&2; return 1; }
+	profile_exists "$AGENT_NAME" "$PROFILE_NAME" || { echo "Missing profile: $PROFILE_NAME" >&2; return 1; }
+
+	[ -d "$CANONICAL_DIR" ] && scan_secret_candidates "$CANONICAL_DIR"
+	[ -d "$LEGACY_TRACKED_DIR" ] && scan_secret_candidates "$LEGACY_TRACKED_DIR"
+	materialize_legacy_profile_source "$AGENT_NAME" "$PROFILE_NAME"
+
+	[ -d "$CANONICAL_DIR" ] || { [ -d "$LOCAL_DIR" ] && return 0; }
+	[ -d "$CANONICAL_DIR" ] || { echo "Missing local profile source: $LOCAL_DIR" >&2; return 1; }
+	scan_secret_candidates "$CANONICAL_DIR"
+	seed_local_profile_from_base "$CANONICAL_DIR" "$LOCAL_DIR"
+}
+
+activate_profile_symlink() {
+	local AGENT_NAME="$1" PROFILE_NAME="$2" GLOBAL_DIR LOCAL_DIR
+	GLOBAL_DIR="$(profile_global_dir "$AGENT_NAME")"
+	LOCAL_DIR="$(local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
+
+	[ -d "$LOCAL_DIR" ] || { echo "Missing local profile: $LOCAL_DIR" >&2; return 1; }
+	mkdir -p "$(dirname "$GLOBAL_DIR")"
+	if [ -e "$GLOBAL_DIR" ] || [ -L "$GLOBAL_DIR" ]; then
+		if [ ! -L "$GLOBAL_DIR" ]; then
+			echo "Refusing to replace existing machine config: $GLOBAL_DIR" >&2
+			echo "Move it into $LOCAL_DIR, back it up, or remove it before switching." >&2
+			return 1
+		fi
+		rm "$GLOBAL_DIR"
+	fi
+	ln -s "$LOCAL_DIR" "$GLOBAL_DIR"
+}
+
+switch_profile() {
+	local AGENT_NAME="$1" PROFILE_NAME="$2"
+	validate_agent_name "$AGENT_NAME"
+	validate_profile_name "$PROFILE_NAME"
+	ensure_switch_local_profile "$AGENT_NAME" "$PROFILE_NAME"
+	activate_profile_symlink "$AGENT_NAME" "$PROFILE_NAME"
 }
 
 copy_path() {
@@ -690,6 +814,14 @@ sync_agent_dir_without_profiles() {
 
 if [ "$LIST_ENVIRONMENTS" = true ]; then
 	list_profiles
+	exit 0
+fi
+
+if [ "$SWITCH_PROFILE" = true ]; then
+	switch_profile "$SWITCH_AGENT" "$ENVIRONMENT"
+	echo ""
+	echo "Switched $SWITCH_AGENT to profile: $ENVIRONMENT"
+	echo ""
 	exit 0
 fi
 
