@@ -716,9 +716,37 @@ if not copied:
 PY
 }
 
+prune_runtime_profile_artifacts() {
+	local TARGET_DIR="$1"
+	[ -d "$TARGET_DIR" ] || return 0
+	python3 - "$TARGET_DIR" <<'PY'
+import shutil
+import sys
+from pathlib import Path
+
+target_dir = Path(sys.argv[1])
+skipped_dir_names = {'.cache', '.git', '.next', '.turbo', 'build', 'coverage', 'dist', 'node_modules', 'tmp'}
+skipped_file_names = {'bun.lock', 'bun.lockb', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock'}
+
+for path in sorted(target_dir.rglob('*'), key=lambda candidate: len(candidate.parts), reverse=True):
+    if path.name in skipped_dir_names and path.is_dir():
+        shutil.rmtree(path)
+        continue
+    if path.name in skipped_file_names and path.is_file():
+        path.unlink()
+PY
+}
+
 bootstrap_profile_from_global() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2" GLOBAL_DIR TARGET_DIR
-	bootstrap_profile_copy_allowlist "$AGENT_NAME" "$PROFILE_NAME"
+	GLOBAL_DIR="$(profile_global_dir "$AGENT_NAME")"
+	TARGET_DIR="$(local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
+	[ -d "$GLOBAL_DIR" ] || { echo "Missing global source: $GLOBAL_DIR" >&2; return 1; }
+	[ ! -L "$GLOBAL_DIR" ] || { echo "Global source is already a symlink: $GLOBAL_DIR" >&2; return 1; }
+	scan_secret_candidates "$GLOBAL_DIR"
+	mkdir -p "$(dirname "$TARGET_DIR")"
+	mv "$GLOBAL_DIR" "$TARGET_DIR"
+	prune_runtime_profile_artifacts "$TARGET_DIR"
 }
 
 seed_local_profile_from_base() {
@@ -803,7 +831,7 @@ ensure_profile_exists() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2"
 	BOOTSTRAPPED_PROFILE_FROM_GLOBAL=false
 	profile_exists "$AGENT_NAME" "$PROFILE_NAME" && return 0
-	[ -d "$(profile_global_dir "$AGENT_NAME")" ] || { echo "Missing profile source and missing global config: $PROFILE_NAME" >&2; return 1; }
+	[ -d "$(profile_global_dir "$AGENT_NAME")" ] && [ ! -L "$(profile_global_dir "$AGENT_NAME")" ] || { echo "Missing profile source and missing global config: $PROFILE_NAME" >&2; return 1; }
 	profile_prompt_create "$PROFILE_NAME"
 	if ! read -r CHOICE; then
 		profile_create_cancelled
@@ -817,6 +845,50 @@ ensure_profile_exists() {
 		*)
 			profile_create_cancelled
 			return 1
+			;;
+	esac
+}
+
+prompt_override_profile_with_global() {
+	local GLOBAL_DIR="$1" LOCAL_DIR="$2"
+	echo ""
+	echo "Existing machine config found: $GLOBAL_DIR"
+	echo "Profile local config already exists: $LOCAL_DIR"
+	printf "Override profile with existing machine config? [y/N]: "
+}
+
+move_global_machine_config_to_local_profile() {
+	local GLOBAL_DIR="$1" LOCAL_DIR="$2"
+	scan_secret_candidates "$GLOBAL_DIR"
+	rm -rf "$LOCAL_DIR"
+	mkdir -p "$(dirname "$LOCAL_DIR")"
+	mv "$GLOBAL_DIR" "$LOCAL_DIR"
+	prune_runtime_profile_artifacts "$LOCAL_DIR"
+}
+
+reconcile_global_machine_config_for_env_profile() {
+	local AGENT_NAME="$1" PROFILE_NAME="$2" GLOBAL_DIR LOCAL_DIR CHOICE
+	GLOBAL_DIR="$(profile_global_dir "$AGENT_NAME")"
+	LOCAL_DIR="$(local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
+
+	[ -e "$GLOBAL_DIR" ] || [ -L "$GLOBAL_DIR" ] || return 0
+	[ ! -L "$GLOBAL_DIR" ] || return 0
+	[ -d "$GLOBAL_DIR" ] || { echo "Existing machine config is not a directory: $GLOBAL_DIR" >&2; return 1; }
+
+	prompt_override_profile_with_global "$GLOBAL_DIR" "$LOCAL_DIR"
+	if ! read -r CHOICE; then
+		echo "Cancelled. Choose y or n." >&2
+		return 1
+	fi
+
+	case "$CHOICE" in
+		y|Y|yes|YES)
+			move_global_machine_config_to_local_profile "$GLOBAL_DIR" "$LOCAL_DIR"
+			echo "Moved existing machine config into profile: $LOCAL_DIR"
+			;;
+		*)
+			rm -rf "$GLOBAL_DIR"
+			echo "Removed existing machine config in favor of profile: $LOCAL_DIR"
 			;;
 	esac
 }
@@ -882,7 +954,8 @@ activate_env_profile() {
 	validate_agent_name "$AGENT_NAME"
 	ensure_profile_exists "$AGENT_NAME" "$PROFILE_NAME"
 	ensure_switch_local_profile "$AGENT_NAME" "$PROFILE_NAME"
-	activate_profile_symlink "$AGENT_NAME" "$PROFILE_NAME" "$BOOTSTRAPPED_PROFILE_FROM_GLOBAL"
+	reconcile_global_machine_config_for_env_profile "$AGENT_NAME" "$PROFILE_NAME"
+	activate_profile_symlink "$AGENT_NAME" "$PROFILE_NAME"
 }
 
 switch_profile() {

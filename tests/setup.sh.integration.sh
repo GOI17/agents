@@ -33,6 +33,24 @@ assert_file_not_contains() {
 	! grep -F "$unexpected" "$path" >/dev/null || { echo "Did not expect '$unexpected' in $path" >&2; exit 1; }
 }
 
+assert_path_missing() {
+	local path="$1"
+	[ ! -e "$path" ] && [ ! -L "$path" ] || { echo "Expected path to be missing: $path" >&2; exit 1; }
+}
+
+assert_no_backup_dirs() {
+	local fixture="$1" backup
+	for backup in "$fixture/home/.config/opencode.backup."*; do
+		[ ! -e "$backup" ] && [ ! -L "$backup" ] || { echo "Expected no opencode backup dir, found: $backup" >&2; exit 1; }
+	done
+}
+
+assert_no_deleted_tracked_files() {
+	local deleted
+	deleted="$(git -C "$ROOT_DIR" ls-files -d)"
+	[ -z "$deleted" ] || { echo "Expected no deleted tracked files, got: $deleted" >&2; exit 1; }
+}
+
 assert_text_not_contains() {
 	local text="$1"
 	local unexpected="$2"
@@ -144,8 +162,10 @@ test_missing_profile_accept_bootstraps() {
 	assert_symlink_target "$fixture/home/.config/opencode" "$local_profile"
 	assert_file_exists "$fixture/home/.config/opencode/opencode.jsonc"
 	assert_file_contains "$local_profile/opencode.jsonc" '"plugin": ["from-global"]'
+	assert_file_contains "$local_profile/notes.txt" 'global-notes'
 	assert_file_contains "$fixture/home/.config/opencode/opencode.jsonc" '"enabled_providers": ["github-copilot"]'
 	assert_file_contains "$fixture/home/.config/opencode/opencode.jsonc" '"plugin": ["from-global"]'
+	assert_no_backup_dirs "$fixture"
 }
 
 test_baylor_bootstrap_uses_root_local_profile_storage() {
@@ -165,6 +185,84 @@ test_baylor_bootstrap_uses_root_local_profile_storage() {
 	assert_file_contains "$local_profile/runtime.txt" 'via-env-symlink'
 }
 
+test_missing_profile_with_global_moves_global_to_root_local_storage() {
+	local fixture local_profile output
+	fixture="$(new_fixture)"
+	local_profile="$fixture/profiles.local/baylor/opencode"
+	rm -rf "$fixture/opencode"
+	rm -rf "$fixture/profiles" "$fixture/profiles.local" "$fixture/environments" "$fixture/environments.local"
+	write_global_config "$fixture"
+
+	output="$(run_setup_with_stdin "$fixture" 'y\n' --env baylor opencode 2>&1)"
+
+	printf '%s' "$output" | grep -F "Setup complete!" >/dev/null
+	assert_file_missing "$fixture/opencode"
+	assert_symlink_target "$fixture/home/.config/opencode" "$local_profile"
+	assert_file_contains "$local_profile/opencode.jsonc" '"plugin": ["from-global"]'
+	assert_file_contains "$local_profile/notes.txt" 'global-notes'
+	assert_file_contains "$fixture/home/.config/opencode/notes.txt" 'global-notes'
+	assert_no_backup_dirs "$fixture"
+}
+
+test_existing_profile_with_global_yes_replaces_local_profile() {
+	local fixture local_profile output
+	fixture="$(new_fixture)"
+	local_profile="$fixture/profiles.local/baylor/opencode"
+	mkdir -p "$local_profile"
+	printf '{"plugin":["local"]}\n' >"$local_profile/opencode.jsonc"
+	printf 'old-local\n' >"$local_profile/local-only.txt"
+	write_global_config "$fixture"
+
+	output="$(run_setup_with_stdin "$fixture" 'y\n' --env baylor opencode 2>&1)"
+
+	printf '%s' "$output" | grep -F "Override profile with existing machine config?" >/dev/null
+	assert_symlink_target "$fixture/home/.config/opencode" "$local_profile"
+	assert_file_contains "$local_profile/opencode.jsonc" '"plugin": ["from-global"]'
+	assert_file_contains "$local_profile/notes.txt" 'global-notes'
+	assert_file_missing "$local_profile/local-only.txt"
+	assert_file_not_contains "$local_profile/opencode.jsonc" '"local"'
+	assert_no_backup_dirs "$fixture"
+}
+
+test_existing_profile_with_global_no_keeps_local_profile() {
+	local fixture local_profile output
+	fixture="$(new_fixture)"
+	local_profile="$fixture/profiles.local/baylor/opencode"
+	mkdir -p "$local_profile"
+	printf '{"plugin":["local"]}\n' >"$local_profile/opencode.jsonc"
+	printf 'local-only\n' >"$local_profile/local-only.txt"
+	write_global_config "$fixture"
+
+	output="$(run_setup_with_stdin "$fixture" 'n\n' --env baylor opencode 2>&1)"
+
+	printf '%s' "$output" | grep -F "Override profile with existing machine config?" >/dev/null
+	assert_symlink_target "$fixture/home/.config/opencode" "$local_profile"
+	assert_file_contains "$local_profile/opencode.jsonc" '"local"'
+	assert_file_contains "$local_profile/local-only.txt" 'local-only'
+	assert_file_missing "$local_profile/notes.txt"
+	assert_path_missing "$fixture/home/.config/opencode/notes.txt"
+	assert_no_backup_dirs "$fixture"
+}
+
+test_tracked_only_profile_with_global_no_keeps_materialized_local_profile() {
+	local fixture local_profile output
+	fixture="$(new_fixture)"
+	local_profile="$fixture/profiles.local/baylor/opencode"
+	rm -rf "$fixture/opencode"
+	mkdir -p "$fixture/profiles/baylor/opencode"
+	printf '{"plugin":["tracked"]}\n' >"$fixture/profiles/baylor/opencode/opencode.jsonc"
+	write_global_config "$fixture"
+
+	output="$(run_setup_with_stdin "$fixture" 'n\n' --env baylor opencode 2>&1)"
+
+	printf '%s' "$output" | grep -F "Override profile with existing machine config?" >/dev/null
+	assert_file_missing "$fixture/opencode"
+	assert_symlink_target "$fixture/home/.config/opencode" "$local_profile"
+	assert_file_contains "$local_profile/opencode.jsonc" '"tracked"'
+	assert_file_missing "$local_profile/notes.txt"
+	assert_path_missing "$fixture/home/.config/opencode/notes.txt"
+}
+
 test_env_uses_root_tracked_profile_without_root_agent_dir() {
 	local fixture local_profile output
 	fixture="$(new_fixture)"
@@ -180,23 +278,6 @@ test_env_uses_root_tracked_profile_without_root_agent_dir() {
 	assert_file_contains "$local_profile/opencode.jsonc" 'root-profile'
 	assert_symlink_target "$fixture/home/.config/opencode" "$local_profile"
 	assert_file_missing "$fixture/opencode"
-}
-
-test_baylor_bootstrap_backs_up_machine_config_before_symlink() {
-	local fixture local_profile output backup_count
-	fixture="$(new_fixture)"
-	local_profile="$fixture/profiles.local/baylor/opencode"
-	write_global_config "$fixture"
-	output="$(run_setup_with_stdin "$fixture" 'y\n' --env baylor opencode 2>&1)"
-	printf '%s' "$output" | grep -F "Backed up existing machine config:" >/dev/null
-	assert_symlink_target "$fixture/home/.config/opencode" "$local_profile"
-	backup_count=0
-	for backup in "$fixture/home/.config/opencode.backup."*; do
-		[ -e "$backup" ] || continue
-		backup_count=$((backup_count + 1))
-		assert_file_contains "$backup/notes.txt" 'global-notes'
-	done
-	[ "$backup_count" -eq 1 ] || { echo "Expected one opencode backup, got $backup_count" >&2; exit 1; }
 }
 
 test_missing_profile_decline_leaves_no_changes() {
@@ -328,7 +409,7 @@ test_env_placeholder_bootstrap_allows_safe_values() {
 	printf '%s' "$output" | grep -F "Setup complete!" >/dev/null
 	assert_file_exists "$fixture/profiles.local/work-sample/opencode/opencode.jsonc"
 	assert_file_contains "$fixture/profiles.local/work-sample/opencode/opencode.jsonc" 'Bearer ${DEMO_TOKEN}'
-	assert_file_missing "$fixture/profiles.local/work-sample/opencode/.env.local"
+	assert_file_exists "$fixture/profiles.local/work-sample/opencode/.env.local"
 	assert_file_missing "$fixture/opencode/profiles.local/work-sample/opencode/opencode.jsonc"
 }
 
@@ -688,9 +769,9 @@ EOF
 	printf 'plugin\n' >"$fixture/home/.config/opencode/plugins/keep-me/manifest.txt"
 	run_setup_with_stdin "$fixture" 'y\n' --env work-sample opencode >/dev/null
 	assert_file_exists "$fixture/profiles.local/work-sample/opencode/opencode.jsonc"
-	assert_file_missing "$fixture/profiles.local/work-sample/opencode/.env"
-	assert_file_missing "$fixture/profiles.local/work-sample/opencode/.env.local"
-	assert_file_missing "$fixture/profiles.local/work-sample/opencode/notes.txt"
+	assert_file_exists "$fixture/profiles.local/work-sample/opencode/.env"
+	assert_file_exists "$fixture/profiles.local/work-sample/opencode/.env.local"
+	assert_file_exists "$fixture/profiles.local/work-sample/opencode/notes.txt"
 	assert_file_exists "$fixture/profiles.local/work-sample/opencode/plugins/keep-me/manifest.txt"
 	assert_file_missing "$fixture/opencode/profiles.local/work-sample/opencode"
 }
@@ -902,6 +983,24 @@ test_env_profile_repoints_existing_profile_symlink() {
 	assert_symlink_target "$fixture/home/.config/opencode" "$baylor_profile"
 }
 
+test_env_profile_repoints_existing_symlink_without_prompt() {
+	local fixture personal_profile baylor_profile output
+	fixture="$(new_fixture)"
+	personal_profile="$fixture/profiles.local/personal/opencode"
+	baylor_profile="$fixture/profiles.local/baylor/opencode"
+	mkdir -p "$personal_profile" "$baylor_profile"
+	printf '{"plugin":["personal"]}\n' >"$personal_profile/opencode.jsonc"
+	printf '{"plugin":["baylor"]}\n' >"$baylor_profile/opencode.jsonc"
+	ln -s "$personal_profile" "$fixture/home/.config/opencode"
+
+	output="$(run_setup "$fixture" --env baylor opencode 2>&1)"
+
+	printf '%s' "$output" | grep -F "Setup complete!" >/dev/null
+	assert_text_not_contains "$output" "Override profile with existing machine config?"
+	assert_symlink_target "$fixture/home/.config/opencode" "$baylor_profile"
+	assert_file_contains "$fixture/home/.config/opencode/opencode.jsonc" '"baylor"'
+}
+
 test_switch_machine_config_edits_affect_local_profile() {
 	local fixture local_profile
 	fixture="$(new_fixture)"
@@ -1037,8 +1136,14 @@ EOF
 	assert_file_contains "$local_profile/local.txt" 'local-notes'
 }
 
+assert_no_deleted_tracked_files
+
 test_missing_profile_accept_bootstraps
 test_baylor_bootstrap_uses_root_local_profile_storage
+test_missing_profile_with_global_moves_global_to_root_local_storage
+test_existing_profile_with_global_yes_replaces_local_profile
+test_existing_profile_with_global_no_keeps_local_profile
+test_tracked_only_profile_with_global_no_keeps_materialized_local_profile
 test_env_uses_root_tracked_profile_without_root_agent_dir
 test_missing_profile_decline_leaves_no_changes
 test_granular_profile_sync
@@ -1074,11 +1179,14 @@ test_switch_seeds_local_profile_and_symlinks_machine_config
 test_switch_uses_root_local_profile_without_root_agent_dir
 test_switch_repoints_existing_profile_symlink
 test_env_profile_repoints_existing_profile_symlink
+test_env_profile_repoints_existing_symlink_without_prompt
 test_switch_machine_config_edits_affect_local_profile
 test_switch_blocks_existing_non_symlink_machine_config
 test_switch_blocks_tracked_profile_literal_secret
 test_switch_allows_tracked_profile_env_placeholder
 test_switch_legacy_tracked_profile_materializes_before_activation
 test_switch_mixed_legacy_tracked_base_and_local_overlay_activation
+
+assert_no_deleted_tracked_files
 
 echo "setup.sh integration tests passed."
