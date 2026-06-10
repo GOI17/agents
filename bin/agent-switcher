@@ -27,6 +27,7 @@ usage() {
 	cat <<'USAGE'
 Usage:
   agent-switcher init
+  agent-switcher doctor
   agent-switcher sync --profile <profile> --agent <agent>
   agent-switcher switch --profile <profile> --agent <agent>
 
@@ -51,7 +52,12 @@ PY
 read_config_repo_path() {
 	[ -n "${AGENT_SWITCHER_REPO:-}" ] && { resolve_path "$AGENT_SWITCHER_REPO"; return 0; }
 	[ -f "$CONFIG_PATH" ] || { echo "Missing agent-switcher config. Run: agent-switcher init" >&2; exit 1; }
-	python3 - "$CONFIG_PATH" <<'PY'
+	read_config_file_repo_path "$CONFIG_PATH"
+}
+
+read_config_file_repo_path() {
+	local CONFIG_FILE="$1"
+	python3 - "$CONFIG_FILE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -70,6 +76,68 @@ if not isinstance(repo_path, str) or not repo_path.strip():
 
 print(Path(repo_path).expanduser().resolve(strict=False))
 PY
+}
+
+doctor_ok() {
+	echo "OK: $1"
+}
+
+doctor_fail() {
+	echo "FAIL: $1" >&2
+	DOCTOR_STATUS=1
+}
+
+run_doctor() {
+	local DOCTOR_STATUS=0 REPO_PATH GIT_PATH
+	echo "agent-switcher doctor"
+
+	if GIT_PATH="$(command -v git 2>/dev/null)"; then
+		doctor_ok "git available: $GIT_PATH"
+	else
+		doctor_fail "git is required but was not found in PATH"
+	fi
+
+	if [ -f "$CONFIG_PATH" ]; then
+		doctor_ok "config found: $CONFIG_PATH"
+		if REPO_PATH="$(read_config_file_repo_path "$CONFIG_PATH")"; then
+			doctor_ok "configured repo path: $REPO_PATH"
+		else
+			doctor_fail "config is not readable JSON with a non-empty repo_path: $CONFIG_PATH"
+		fi
+	else
+		doctor_fail "missing config: $CONFIG_PATH (run: agent-switcher init)"
+	fi
+
+	if [ -n "${REPO_PATH:-}" ] && [ -d "$REPO_PATH" ]; then
+		doctor_ok "repo directory exists: $REPO_PATH"
+	else
+		doctor_fail "configured repo directory does not exist: ${REPO_PATH:-<unknown>}"
+	fi
+
+	if [ -n "${REPO_PATH:-}" ] && [ -d "$REPO_PATH/.git" ]; then
+		doctor_ok "repo has .git directory"
+	else
+		doctor_fail "configured repo is missing .git directory"
+	fi
+
+	if [ -n "${REPO_PATH:-}" ] && [ -d "$REPO_PATH/profiles" ]; then
+		doctor_ok "profiles/ directory exists"
+	else
+		doctor_fail "configured repo is missing profiles/"
+	fi
+
+	if [ -n "${REPO_PATH:-}" ] && [ -d "$REPO_PATH/profiles.local" ]; then
+		doctor_ok "profiles.local/ directory exists"
+	else
+		doctor_fail "configured repo is missing profiles.local/"
+	fi
+
+	if [ "$DOCTOR_STATUS" -eq 0 ]; then
+		echo "Doctor passed."
+	else
+		echo "Doctor failed." >&2
+	fi
+	return "$DOCTOR_STATUS"
 }
 
 write_config_repo_path() {
@@ -229,6 +297,11 @@ case "$COMMAND" in
 		shift
 		[ "$#" -eq 0 ] || { usage; exit 1; }
 		run_init
+		;;
+	doctor)
+		shift
+		[ "$#" -eq 0 ] || { usage; exit 1; }
+		run_doctor
 		;;
 	sync)
 		shift

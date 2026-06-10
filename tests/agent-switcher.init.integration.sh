@@ -138,6 +138,23 @@ test_init_location_that_already_includes_repo_name() {
 	assert_output_contains "$output" "Initialized agent-switcher repo: $repo"
 }
 
+test_init_refuses_non_empty_incompatible_directory() {
+	local fixture repo output
+	fixture="$(new_fixture)"
+	repo="$(resolve_path "$fixture/not-agent-switcher")"
+	mkdir -p "$repo"
+	printf 'keep-me\n' >"$repo/existing.txt"
+
+	if output="$(run_cli_with_stdin "$fixture" "$repo\nnot-agent-switcher\n" init 2>&1)"; then
+		echo "Expected init to refuse non-empty incompatible directory" >&2
+		exit 1
+	fi
+
+	assert_output_contains "$output" "Refusing to overwrite non-empty directory: $repo"
+	assert_file_contains "$repo/existing.txt" 'keep-me'
+	[ ! -e "$fixture/home/.config/agent-switcher/config.json" ] || { echo "Expected no config to be written" >&2; exit 1; }
+}
+
 write_configured_repo() {
 	local fixture="$1" repo="$2"
 	mkdir -p "$repo/profiles/baylor/opencode"
@@ -203,14 +220,56 @@ EOF
 	assert_file_contains "$fixture/home/.config/opencode/opencode.jsonc" '"from-configured-repo"'
 }
 
+test_help_lists_doctor_without_mutation() {
+	local fixture output
+	fixture="$(new_fixture)"
+
+	output="$(run_cli "$fixture" --help 2>&1)"
+
+	assert_output_contains "$output" "agent-switcher doctor"
+	[ ! -e "$fixture/home/.config/agent-switcher/config.json" ] || { echo "Expected help to be non-mutating" >&2; exit 1; }
+}
+
+test_doctor_passes_for_initialized_repo() {
+	local fixture repo output
+	fixture="$(new_fixture)"
+	repo="$(resolve_path "$fixture/configured-repo")"
+	mkdir -p "$repo/profiles" "$repo/profiles.local" "$repo/.git" "$fixture/home/.config/agent-switcher"
+	printf '{"repo_path":"%s"}\n' "$repo" >"$fixture/home/.config/agent-switcher/config.json"
+
+	output="$(run_cli "$fixture" doctor 2>&1)"
+
+	assert_output_contains "$output" "OK: config found: $fixture/home/.config/agent-switcher/config.json"
+	assert_output_contains "$output" "OK: profiles/ directory exists"
+	assert_output_contains "$output" "OK: profiles.local/ directory exists"
+	assert_output_contains "$output" "Doctor passed."
+}
+
+test_doctor_fails_without_config() {
+	local fixture output
+	fixture="$(new_fixture)"
+
+	if output="$(run_cli "$fixture" doctor 2>&1)"; then
+		echo "Expected doctor to fail without config" >&2
+		exit 1
+	fi
+
+	assert_output_contains "$output" "FAIL: missing config: $fixture/home/.config/agent-switcher/config.json"
+	assert_output_contains "$output" "Doctor failed."
+}
+
 assert_no_deleted_tracked_files
 
 test_init_with_absolute_parent_path
 test_init_with_dot_relative_to_fixture_cwd
 test_init_location_that_already_includes_repo_name
+test_init_refuses_non_empty_incompatible_directory
 test_sync_uses_configured_repo_path
 test_switch_uses_configured_repo_path
 test_symlinked_cli_uses_bundled_setup_for_sync_and_switch
+test_help_lists_doctor_without_mutation
+test_doctor_passes_for_initialized_repo
+test_doctor_fails_without_config
 
 assert_no_deleted_tracked_files
 
