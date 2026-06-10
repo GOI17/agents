@@ -17,8 +17,8 @@ Usage:
   ./setup.sh --list-envs             Show configured profiles
 
 Profile-first layouts:
-  Tracked profiles live in:          <agent>/profiles/<profile>/<agent>/...
-  Private profiles live in:          <agent>/profiles.local/<profile>/<agent>/...
+  Tracked profiles live in:          profiles/<profile>/<agent>/...
+  Private profiles live in:          profiles.local/<profile>/<agent>/...
 
 For opencode.json/opencode.jsonc, setup merges JSON/JSONC layers in this order:
   canonical profile -> legacy profile
@@ -47,6 +47,7 @@ LIST_ENVIRONMENTS=false
 SWITCH_PROFILE=false
 SWITCH_AGENT=""
 TEMP_FILES=()
+BOOTSTRAPPED_PROFILE_FROM_GLOBAL=false
 
 cleanup_temp_files() {
 	local TEMP_FILE
@@ -174,6 +175,11 @@ is_profile_dir_name() {
 	[ "$ENTRY_NAME" = "$PROFILE_DIR_NAME" ] || [ "$ENTRY_NAME" = "$PROFILE_LOCAL_DIR_NAME" ]
 }
 
+is_profile_storage_root_name() {
+	local ENTRY_NAME="$1"
+	is_profile_dir_name "$ENTRY_NAME" || [ "$ENTRY_NAME" = "$LEGACY_ENV_DIR_NAME" ] || [ "$ENTRY_NAME" = "$LEGACY_LOCAL_ENV_DIR_NAME" ]
+}
+
 is_guarded_opencode_config() {
 	local AGENT_NAME="$1" RELATIVE_PATH="$2"
 	[ "$AGENT_NAME" = "opencode" ] || return 1
@@ -240,30 +246,35 @@ sync_guarded_opencode_config() {
 }
 
 list_profiles() {
-	local AGENT_DIR ROOT PROFILE_DIR FOUND=false
-	for AGENT_DIR in "$SCRIPT_PATH"/*/; do
-		[ -d "$AGENT_DIR" ] || continue
-		for ROOT in "$PROFILE_DIR_NAME" "$PROFILE_LOCAL_DIR_NAME"; do
-			[ -d "$AGENT_DIR/$ROOT" ] || continue
-			for PROFILE_DIR in "$AGENT_DIR/$ROOT"/*/; do
-				[ -d "$PROFILE_DIR" ] || continue
+	local ROOT PROFILE_DIR AGENT_DIR FOUND=false
+	for ROOT in "$PROFILE_DIR_NAME" "$PROFILE_LOCAL_DIR_NAME" "$LEGACY_ENV_DIR_NAME" "$LEGACY_LOCAL_ENV_DIR_NAME"; do
+		[ -d "$SCRIPT_PATH/$ROOT" ] || continue
+		for PROFILE_DIR in "$SCRIPT_PATH/$ROOT"/*/; do
+			[ -d "$PROFILE_DIR" ] || continue
+			for AGENT_DIR in "$PROFILE_DIR"*/; do
+				[ -d "$AGENT_DIR" ] || continue
 				FOUND=true
-				echo "$(basename "$PROFILE_DIR") ($(basename "$AGENT_DIR")/$ROOT)"
+				echo "$(basename "$PROFILE_DIR")/$(basename "$AGENT_DIR") ($ROOT)"
 			done
 		done
 	done
 
 	if [ "$FOUND" = false ]; then
-		echo "No profiles found. Create <agent>/profiles/<profile>/<agent>/ or <agent>/profiles.local/<profile>/<agent>/ ."
+		echo "No profiles found. Create profiles/<profile>/<agent>/ or profiles.local/<profile>/<agent>/ ."
 	fi
 }
 
 profile_exists() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2"
-	[ -d "$SCRIPT_PATH/$AGENT_NAME/$PROFILE_DIR_NAME/$PROFILE_NAME/$AGENT_NAME" ] && return 0
-	[ -d "$SCRIPT_PATH/$AGENT_NAME/$PROFILE_LOCAL_DIR_NAME/$PROFILE_NAME/$AGENT_NAME" ] && return 0
-	[ -d "$SCRIPT_PATH/$AGENT_NAME/$LEGACY_ENV_DIR_NAME/$PROFILE_NAME/$AGENT_NAME" ] && return 0
-	[ -d "$SCRIPT_PATH/$AGENT_NAME/$LEGACY_LOCAL_ENV_DIR_NAME/$PROFILE_NAME/$AGENT_NAME" ] && return 0
+	materialize_legacy_profile_source "$AGENT_NAME" "$PROFILE_NAME"
+	[ -d "$(canonical_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" ] && return 0
+	[ -d "$(local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" ] && return 0
+	[ -d "$(legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" ] && return 0
+	[ -d "$(legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" ] && return 0
+	[ -d "$(agent_nested_canonical_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" ] && return 0
+	[ -d "$(agent_nested_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" ] && return 0
+	[ -d "$(agent_nested_legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" ] && return 0
+	[ -d "$(agent_nested_legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" ] && return 0
 	return 1
 }
 
@@ -284,29 +295,65 @@ profile_global_dir() {
 
 canonical_profile_agent_dir() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2"
-	echo "$SCRIPT_PATH/$AGENT_NAME/$PROFILE_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
+	echo "$SCRIPT_PATH/$PROFILE_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
 }
 
 local_profile_agent_dir() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2"
-	echo "$SCRIPT_PATH/$AGENT_NAME/$PROFILE_LOCAL_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
+	echo "$SCRIPT_PATH/$PROFILE_LOCAL_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
 }
 
 legacy_profile_agent_dir() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2"
-	echo "$SCRIPT_PATH/$AGENT_NAME/$LEGACY_ENV_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
+	echo "$SCRIPT_PATH/$LEGACY_ENV_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
 }
 
 legacy_local_profile_agent_dir() {
+	local AGENT_NAME="$1" PROFILE_NAME="$2"
+	echo "$SCRIPT_PATH/$LEGACY_LOCAL_ENV_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
+}
+
+agent_nested_canonical_profile_agent_dir() {
+	local AGENT_NAME="$1" PROFILE_NAME="$2"
+	echo "$SCRIPT_PATH/$AGENT_NAME/$PROFILE_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
+}
+
+agent_nested_local_profile_agent_dir() {
+	local AGENT_NAME="$1" PROFILE_NAME="$2"
+	echo "$SCRIPT_PATH/$AGENT_NAME/$PROFILE_LOCAL_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
+}
+
+agent_nested_legacy_profile_agent_dir() {
+	local AGENT_NAME="$1" PROFILE_NAME="$2"
+	echo "$SCRIPT_PATH/$AGENT_NAME/$LEGACY_ENV_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
+}
+
+agent_nested_legacy_local_profile_agent_dir() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2"
 	echo "$SCRIPT_PATH/$AGENT_NAME/$LEGACY_LOCAL_ENV_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
 }
 
 profile_legacy_source_dirs() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2" CANDIDATE
-	for CANDIDATE in "$(legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" "$(legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"; do
+	for CANDIDATE in \
+		"$(legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" \
+		"$(legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" \
+		"$(agent_nested_legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" \
+		"$(agent_nested_legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"; do
 		[ -d "$CANDIDATE" ] && echo "$CANDIDATE"
 	done
+}
+
+scan_tracked_profile_sources() {
+	local AGENT_NAME="$1" PROFILE_NAME="$2" CANDIDATE
+	for CANDIDATE in \
+		"$(canonical_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" \
+		"$(legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" \
+		"$(agent_nested_canonical_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" \
+		"$(agent_nested_legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"; do
+		[ -d "$CANDIDATE" ] && scan_secret_candidates "$CANDIDATE"
+	done
+	return 0
 }
 
 merge_json_config_file() {
@@ -431,11 +478,19 @@ profile_source_dir() {
 	materialize_legacy_profile_source "$AGENT_NAME" "$PROFILE_NAME"
 	CANDIDATE="$(canonical_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
 	[ -d "$CANDIDATE" ] && { echo "$CANDIDATE"; return 0; }
-	CANDIDATE="$SCRIPT_PATH/$AGENT_NAME/$PROFILE_LOCAL_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
+	CANDIDATE="$(local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
 	[ -d "$CANDIDATE" ] && { echo "$CANDIDATE"; return 0; }
 	CANDIDATE="$(legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
 	[ -d "$CANDIDATE" ] && { echo "$CANDIDATE"; return 0; }
 	CANDIDATE="$(legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
+	[ -d "$CANDIDATE" ] && { echo "$CANDIDATE"; return 0; }
+	CANDIDATE="$(agent_nested_canonical_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
+	[ -d "$CANDIDATE" ] && { echo "$CANDIDATE"; return 0; }
+	CANDIDATE="$(agent_nested_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
+	[ -d "$CANDIDATE" ] && { echo "$CANDIDATE"; return 0; }
+	CANDIDATE="$(agent_nested_legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
+	[ -d "$CANDIDATE" ] && { echo "$CANDIDATE"; return 0; }
+	CANDIDATE="$(agent_nested_legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
 	[ -d "$CANDIDATE" ] && { echo "$CANDIDATE"; return 0; }
 	return 1
 }
@@ -447,13 +502,31 @@ scan_secret_candidates() {
 	TMP_OUTPUT="$(mktemp "${TMPDIR:-/tmp}/agents-setup-secret-scan.XXXXXX")"
 	TEMP_FILES+=("$TMP_OUTPUT")
 	python3 - "$SOURCE_DIR" <<'PY' >"$TMP_OUTPUT"
-import json, math, re, sys
+import json, math, os, re, sys
 from pathlib import Path
 
 source_dir = Path(sys.argv[1])
 key_patterns = re.compile(r"(^|.*[._-])(key|apikey|token|secret|password|authorization|credential|headers)$", re.I)
 value_patterns = [re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{12,}"), re.compile(r"sk-[A-Za-z0-9]{16,}"), re.compile(r"ghp_[A-Za-z0-9]{20,}")]
 placeholder_pattern = re.compile(r"^Bearer\s+\$\{[A-Z0-9_]+\}$|^\$\{[A-Z0-9_]+\}$")
+skipped_dir_names = {
+    '.cache',
+    '.git',
+    '.next',
+    '.turbo',
+    'build',
+    'coverage',
+    'dist',
+    'node_modules',
+    'tmp',
+}
+skipped_file_names = {
+    'bun.lock',
+    'bun.lockb',
+    'package-lock.json',
+    'pnpm-lock.yaml',
+    'yarn.lock',
+}
 
 def strip_jsonc(text):
     out=[]; in_string=False; escaped=False; i=0
@@ -503,10 +576,7 @@ def load_jsonc(path):
     cleaned = remove_trailing_commas(strip_jsonc(text)).strip()
     if not cleaned:
         return None
-    value = json.loads(cleaned)
-    if not isinstance(value, dict):
-        raise TypeError(path)
-    return value
+    return json.loads(cleaned)
 
 def path_label(path):
     return str(path.as_posix())
@@ -518,8 +588,25 @@ def entropy(value):
     total=len(value)
     return -sum((count/total) * math.log2(count/total) for count in counts.values())
 
-def suspicious_value(value):
-    return isinstance(value, str) and not placeholder_pattern.search(value) and (any(p.search(value) for p in value_patterns) or (len(value) >= 32 and entropy(value) >= 4.0))
+def is_path_like_key(key):
+    return any(ch in str(key) for ch in ('/', '*', '~'))
+
+def is_permission_pattern_path(path):
+    return len(path) >= 3 and path[0] == 'permission'
+
+def is_sensitive_key(key):
+    key = str(key)
+    return key_patterns.search(key) and (not is_path_like_key(key) or key.lower() == 'authorization')
+
+def sensitive_path(path):
+    return any(is_sensitive_key(part) for part in path)
+
+def suspicious_value(value, path):
+    if not isinstance(value, str) or placeholder_pattern.search(value):
+        return False
+    if any(p.search(value) for p in value_patterns):
+        return True
+    return sensitive_path(path) and len(value) >= 32 and entropy(value) >= 4.0
 
 def subtree_has_placeholder(value):
     if isinstance(value, str):
@@ -535,19 +622,28 @@ def walk(value, path=()):
     if isinstance(value, dict):
         for key, child in value.items():
             child_path = path + (str(key),)
-            if key_patterns.search(str(key)) and not subtree_has_placeholder(child):
+            if is_sensitive_key(key) and str(key).lower() != 'headers' and not is_permission_pattern_path(child_path) and not subtree_has_placeholder(child):
                 findings.append(("/".join(child_path),))
             findings.extend(walk(child, child_path))
     elif isinstance(value, list):
         for index, child in enumerate(value): findings.extend(walk(child, path + (str(index),)))
-    elif suspicious_value(value):
+    elif suspicious_value(value, path):
         findings.append(("/".join(path) or "value",))
     return findings
 
 parse_errors=[]
-for candidate in sorted(source_dir.rglob('*.json')) + sorted(source_dir.rglob('*.jsonc')):
-    if any(part.startswith('.env') for part in candidate.parts):
-        continue
+candidate_paths=[]
+for root, dirnames, filenames in os.walk(source_dir):
+    dirnames[:] = [dirname for dirname in dirnames if dirname not in skipped_dir_names and not dirname.startswith('.env')]
+    root_path = Path(root)
+    for filename in filenames:
+        if filename in skipped_file_names:
+            continue
+        if filename.startswith('.env') or not (filename.endswith('.json') or filename.endswith('.jsonc')):
+            continue
+        candidate_paths.append(root_path / filename)
+
+for candidate in sorted(candidate_paths):
     try:
         data = load_jsonc(candidate)
     except Exception as exc:
@@ -573,7 +669,7 @@ PY
 bootstrap_profile_copy_allowlist() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2" GLOBAL_DIR TARGET_DIR
 	GLOBAL_DIR="$(profile_global_dir "$AGENT_NAME")"
-	TARGET_DIR="$SCRIPT_PATH/$AGENT_NAME/$PROFILE_LOCAL_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
+	TARGET_DIR="$(local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
 	[ -d "$GLOBAL_DIR" ] || { echo "Missing global source: $GLOBAL_DIR" >&2; return 1; }
 	scan_secret_candidates "$GLOBAL_DIR"
 	mkdir -p "$TARGET_DIR"
@@ -586,10 +682,11 @@ from pathlib import Path
 source_dir = Path(sys.argv[1])
 target_dir = Path(sys.argv[2])
 allowlisted = {"opencode.json", "opencode.jsonc", "plugins", "commands", "prompts", "skills", "tui.json"}
+skipped_dir_names = {'.cache', '.git', '.next', '.turbo', 'build', 'coverage', 'dist', 'node_modules', 'tmp'}
 copied = False
 
 def excluded(path: Path) -> bool:
-    return any(part.startswith('.env') for part in path.parts)
+    return any(part.startswith('.env') or part in skipped_dir_names for part in path.parts)
 
 def copy_entry(source: Path, target: Path) -> None:
     global copied
@@ -635,9 +732,16 @@ from pathlib import Path
 
 base_dir = Path(sys.argv[1])
 local_dir = Path(sys.argv[2])
+skipped_dir_names = {'.cache', '.git', '.next', '.turbo', 'build', 'coverage', 'dist', 'node_modules', 'tmp'}
+skipped_file_names = {'bun.lock', 'bun.lockb', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock'}
+
+def excluded(path: Path) -> bool:
+    return path.name in skipped_file_names or any(part in skipped_dir_names for part in path.parts)
 
 for source in sorted(base_dir.rglob('*')):
     relative_path = source.relative_to(base_dir)
+    if excluded(relative_path):
+        continue
     target = local_dir / relative_path
     if target.exists() or target.is_symlink():
         continue
@@ -657,14 +761,39 @@ PY
 	done
 }
 
+merge_profile_json_layers_into_local() {
+	local AGENT_NAME="$1" PROFILE_NAME="$2" LOCAL_DIR LEGACY_DIR RELATIVE_PATH
+	LOCAL_DIR="$(local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
+	[ -d "$LOCAL_DIR" ] || return 0
+	while IFS= read -r LEGACY_DIR; do
+		[ -n "$LEGACY_DIR" ] || continue
+		[ "$LEGACY_DIR" = "$LOCAL_DIR" ] && continue
+		for RELATIVE_PATH in opencode.json opencode.jsonc; do
+			if [ -e "$LOCAL_DIR/$RELATIVE_PATH" ] && [ -e "$LEGACY_DIR/$RELATIVE_PATH" ]; then
+				merge_json_config_file "$LOCAL_DIR/$RELATIVE_PATH" "$LEGACY_DIR/$RELATIVE_PATH" "$LOCAL_DIR/$RELATIVE_PATH"
+			fi
+		done
+	done <<EOF
+$(profile_legacy_source_dirs "$AGENT_NAME" "$PROFILE_NAME")
+EOF
+}
+
 materialize_legacy_profile_source() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2" SOURCE_DIR DEST_DIR
-	for SOURCE_DIR in "$(legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" "$(legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"; do
+	for SOURCE_DIR in \
+		"$(legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" \
+		"$(legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" \
+		"$(agent_nested_legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" \
+		"$(agent_nested_legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" \
+		"$(agent_nested_canonical_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" \
+		"$(agent_nested_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"; do
 		[ -d "$SOURCE_DIR" ] || continue
-		if [ "$SOURCE_DIR" = "$(legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" ]; then
+		if [ "$SOURCE_DIR" = "$(legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" ] || \
+			[ "$SOURCE_DIR" = "$(agent_nested_legacy_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" ] || \
+			[ "$SOURCE_DIR" = "$(agent_nested_local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")" ]; then
 			DEST_DIR="$(local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
 		else
-			DEST_DIR="$SCRIPT_PATH/$AGENT_NAME/$PROFILE_DIR_NAME/$PROFILE_NAME/$AGENT_NAME"
+			DEST_DIR="$(canonical_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
 		fi
 		[ -e "$DEST_DIR" ] || copy_path "$SOURCE_DIR" "$DEST_DIR"
 	done
@@ -672,6 +801,7 @@ materialize_legacy_profile_source() {
 
 ensure_profile_exists() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2"
+	BOOTSTRAPPED_PROFILE_FROM_GLOBAL=false
 	profile_exists "$AGENT_NAME" "$PROFILE_NAME" && return 0
 	[ -d "$(profile_global_dir "$AGENT_NAME")" ] || { echo "Missing profile source and missing global config: $PROFILE_NAME" >&2; return 1; }
 	profile_prompt_create "$PROFILE_NAME"
@@ -682,6 +812,7 @@ ensure_profile_exists() {
 	case "$CHOICE" in
 		y|Y|yes|YES)
 			bootstrap_profile_from_global "$AGENT_NAME" "$PROFILE_NAME"
+			BOOTSTRAPPED_PROFILE_FROM_GLOBAL=true
 			;;
 		*)
 			profile_create_cancelled
@@ -691,26 +822,39 @@ ensure_profile_exists() {
 }
 
 ensure_switch_local_profile() {
-	local AGENT_NAME="$1" PROFILE_NAME="$2" CANONICAL_DIR LOCAL_DIR LEGACY_TRACKED_DIR
+	local AGENT_NAME="$1" PROFILE_NAME="$2" CANONICAL_DIR LOCAL_DIR LEGACY_TRACKED_DIR AGENT_NESTED_TRACKED_DIR
 	CANONICAL_DIR="$(canonical_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
 	LOCAL_DIR="$(local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
 	LEGACY_TRACKED_DIR="$(legacy_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
+	AGENT_NESTED_TRACKED_DIR="$(agent_nested_canonical_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
 
-	[ -d "$SCRIPT_PATH/$AGENT_NAME" ] || { echo "Missing agent config directory: $SCRIPT_PATH/$AGENT_NAME" >&2; return 1; }
 	profile_exists "$AGENT_NAME" "$PROFILE_NAME" || { echo "Missing profile: $PROFILE_NAME" >&2; return 1; }
 
 	[ -d "$CANONICAL_DIR" ] && scan_secret_candidates "$CANONICAL_DIR"
 	[ -d "$LEGACY_TRACKED_DIR" ] && scan_secret_candidates "$LEGACY_TRACKED_DIR"
+	[ -d "$AGENT_NESTED_TRACKED_DIR" ] && scan_secret_candidates "$AGENT_NESTED_TRACKED_DIR"
 	materialize_legacy_profile_source "$AGENT_NAME" "$PROFILE_NAME"
 
 	[ -d "$CANONICAL_DIR" ] || { [ -d "$LOCAL_DIR" ] && return 0; }
 	[ -d "$CANONICAL_DIR" ] || { echo "Missing local profile source: $LOCAL_DIR" >&2; return 1; }
 	scan_secret_candidates "$CANONICAL_DIR"
 	seed_local_profile_from_base "$CANONICAL_DIR" "$LOCAL_DIR"
+	merge_profile_json_layers_into_local "$AGENT_NAME" "$PROFILE_NAME"
+}
+
+move_existing_machine_config_to_backup() {
+	local GLOBAL_DIR="$1" BACKUP_PATH COUNTER=0
+	BACKUP_PATH="$GLOBAL_DIR.backup.$(date +%Y%m%d%H%M%S)"
+	while [ -e "$BACKUP_PATH" ] || [ -L "$BACKUP_PATH" ]; do
+		COUNTER=$((COUNTER + 1))
+		BACKUP_PATH="$GLOBAL_DIR.backup.$(date +%Y%m%d%H%M%S).$COUNTER"
+	done
+	mv "$GLOBAL_DIR" "$BACKUP_PATH"
+	echo "$BACKUP_PATH"
 }
 
 activate_profile_symlink() {
-	local AGENT_NAME="$1" PROFILE_NAME="$2" GLOBAL_DIR LOCAL_DIR
+	local AGENT_NAME="$1" PROFILE_NAME="$2" ALLOW_BACKUP_EXISTING="${3:-false}" GLOBAL_DIR LOCAL_DIR BACKUP_PATH
 	GLOBAL_DIR="$(profile_global_dir "$AGENT_NAME")"
 	LOCAL_DIR="$(local_profile_agent_dir "$AGENT_NAME" "$PROFILE_NAME")"
 
@@ -718,13 +862,27 @@ activate_profile_symlink() {
 	mkdir -p "$(dirname "$GLOBAL_DIR")"
 	if [ -e "$GLOBAL_DIR" ] || [ -L "$GLOBAL_DIR" ]; then
 		if [ ! -L "$GLOBAL_DIR" ]; then
-			echo "Refusing to replace existing machine config: $GLOBAL_DIR" >&2
-			echo "Move it into $LOCAL_DIR, back it up, or remove it before switching." >&2
-			return 1
+			if [ "$ALLOW_BACKUP_EXISTING" = true ]; then
+				BACKUP_PATH="$(move_existing_machine_config_to_backup "$GLOBAL_DIR")"
+				echo "Backed up existing machine config: $BACKUP_PATH"
+			else
+				echo "Refusing to replace existing machine config: $GLOBAL_DIR" >&2
+				echo "Move it into $LOCAL_DIR, back it up, or remove it before switching." >&2
+				return 1
+			fi
+		else
+			rm "$GLOBAL_DIR"
 		fi
-		rm "$GLOBAL_DIR"
 	fi
 	ln -s "$LOCAL_DIR" "$GLOBAL_DIR"
+}
+
+activate_env_profile() {
+	local AGENT_NAME="$1" PROFILE_NAME="$2"
+	validate_agent_name "$AGENT_NAME"
+	ensure_profile_exists "$AGENT_NAME" "$PROFILE_NAME"
+	ensure_switch_local_profile "$AGENT_NAME" "$PROFILE_NAME"
+	activate_profile_symlink "$AGENT_NAME" "$PROFILE_NAME" "$BOOTSTRAPPED_PROFILE_FROM_GLOBAL"
 }
 
 switch_profile() {
@@ -743,9 +901,52 @@ copy_path() {
 	cp -R "$SOURCE_PATH" "$DEST_PATH"
 }
 
+copy_profile_dir() {
+	local SOURCE_DIR="$1" DEST_DIR="$2"
+	[ -d "$SOURCE_DIR" ] || { echo "Missing source: $SOURCE_DIR" >&2; exit 1; }
+	mkdir -p "$DEST_DIR"
+	python3 - "$SOURCE_DIR" "$DEST_DIR" <<'PY'
+import os
+import shutil
+import sys
+from pathlib import Path
+
+source_dir = Path(sys.argv[1])
+dest_dir = Path(sys.argv[2])
+skipped_dir_names = {'.cache', '.git', '.next', '.turbo', 'build', 'coverage', 'dist', 'node_modules', 'tmp'}
+skipped_file_names = {'bun.lock', 'bun.lockb', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock'}
+
+def excluded(path: Path) -> bool:
+    return path.name in skipped_file_names or any(part in skipped_dir_names for part in path.parts)
+
+def copy_entry(source: Path, target: Path) -> None:
+    if excluded(source.relative_to(source_dir)):
+        return
+    if source.is_dir() and not source.is_symlink():
+        target.mkdir(parents=True, exist_ok=True)
+        for child in source.iterdir():
+            copy_entry(child, target / child.name)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() or target.is_symlink():
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+    if source.is_symlink():
+        target.symlink_to(source.readlink())
+    else:
+        shutil.copy2(source, target)
+
+for entry in source_dir.iterdir():
+    copy_entry(entry, dest_dir / entry.name)
+PY
+}
+
 sync_profile_relative_path() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2" RELATIVE_PATH="$3" SOURCE_DIR SOURCE_PATH DEST_PATH
 	validate_relative_path "$RELATIVE_PATH"
+	scan_tracked_profile_sources "$AGENT_NAME" "$PROFILE_NAME"
 	SOURCE_DIR="$(profile_source_dir "$AGENT_NAME" "$PROFILE_NAME")" || { echo "Missing profile: $PROFILE_NAME" >&2; exit 1; }
 	SOURCE_PATH="$SOURCE_DIR/$RELATIVE_PATH"
 	DEST_PATH="$CONFIG_DIR/$AGENT_NAME/$RELATIVE_PATH"
@@ -765,10 +966,10 @@ EOF
 
 sync_profile_dir() {
 	local AGENT_NAME="$1" PROFILE_NAME="$2" SOURCE_DIR DEST_DIR
+	scan_tracked_profile_sources "$AGENT_NAME" "$PROFILE_NAME"
 	SOURCE_DIR="$(profile_source_dir "$AGENT_NAME" "$PROFILE_NAME")" || { echo "Missing profile: $PROFILE_NAME" >&2; exit 1; }
 	DEST_DIR="$CONFIG_DIR/$AGENT_NAME"
-	mkdir -p "$DEST_DIR"
-	cp -R "$SOURCE_DIR"/. "$DEST_DIR"/
+	copy_profile_dir "$SOURCE_DIR" "$DEST_DIR"
 	if [ -e "$SOURCE_DIR/opencode.json" ] || [ -e "$SOURCE_DIR/opencode.jsonc" ]; then
 		while IFS= read -r LEGACY_DIR; do
 			[ -n "$LEGACY_DIR" ] || continue
@@ -848,8 +1049,7 @@ fi
 if [ "$#" -eq 1 ]; then
 	AGENT_NAME="$1"
 	if [ -n "$ENVIRONMENT" ]; then
-		ensure_profile_exists "$AGENT_NAME" "$ENVIRONMENT"
-		sync_profile_dir "$AGENT_NAME" "$ENVIRONMENT"
+		activate_env_profile "$AGENT_NAME" "$ENVIRONMENT"
 	else
 		sync_agent_dir_without_profiles "$AGENT_NAME"
 	fi
@@ -862,6 +1062,7 @@ fi
 for AGENT_DIR in "$SCRIPT_PATH"/*/; do
 	[ -d "$AGENT_DIR" ] || continue
 	AGENT_NAME="$(basename "$AGENT_DIR")"
+	is_profile_storage_root_name "$AGENT_NAME" && continue
 	sync_agent_dir_without_profiles "$AGENT_NAME"
 done
 
