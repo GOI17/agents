@@ -1,0 +1,250 @@
+#!/bin/bash
+
+set -euo pipefail
+
+resolve_script_path() {
+	local SOURCE="$1" DIR
+	while [ -h "$SOURCE" ]; do
+		DIR="$(cd -P -- "$(dirname -- "$SOURCE")" && pwd)"
+		SOURCE="$(readlink "$SOURCE")"
+		case "$SOURCE" in
+			/*) ;;
+			*) SOURCE="$DIR/$SOURCE" ;;
+		esac
+	done
+	DIR="$(cd -P -- "$(dirname -- "$SOURCE")" && pwd)"
+	printf '%s/%s\n' "$DIR" "$(basename -- "$SOURCE")"
+}
+
+SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]}")"
+CLI_DIR="$(cd -P -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+INSTALL_ROOT="$(cd -P -- "$CLI_DIR/.." && pwd)"
+SETUP_SH="$INSTALL_ROOT/setup.sh"
+CONFIG_DIR="$HOME/.config/agent-switcher"
+CONFIG_PATH="$CONFIG_DIR/config.json"
+
+usage() {
+	cat <<'USAGE'
+Usage:
+  agent-switcher init
+  agent-switcher sync --profile <profile> --agent <agent>
+  agent-switcher switch --profile <profile> --agent <agent>
+
+Environment:
+  AGENT_SWITCHER_REPO  Override the configured agents repo path.
+USAGE
+}
+
+resolve_path() {
+	local RAW_PATH="$1"
+	python3 - "$RAW_PATH" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+raw_path = sys.argv[1]
+expanded = os.path.expanduser(raw_path)
+print(Path(expanded).resolve(strict=False))
+PY
+}
+
+read_config_repo_path() {
+	[ -n "${AGENT_SWITCHER_REPO:-}" ] && { resolve_path "$AGENT_SWITCHER_REPO"; return 0; }
+	[ -f "$CONFIG_PATH" ] || { echo "Missing agent-switcher config. Run: agent-switcher init" >&2; exit 1; }
+	python3 - "$CONFIG_PATH" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+try:
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"Invalid config file: {config_path} ({exc.__class__.__name__})", file=sys.stderr)
+    raise SystemExit(1)
+
+repo_path = data.get("repo_path")
+if not isinstance(repo_path, str) or not repo_path.strip():
+    print(f"Config file is missing repo_path: {config_path}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(Path(repo_path).expanduser().resolve(strict=False))
+PY
+}
+
+write_config_repo_path() {
+	local REPO_PATH="$1"
+	mkdir -p "$CONFIG_DIR"
+	python3 - "$CONFIG_PATH" "$REPO_PATH" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+repo_path = sys.argv[2]
+config_path.write_text(json.dumps({"repo_path": repo_path}, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+is_compatible_repo() {
+	local REPO_PATH="$1"
+	[ -d "$REPO_PATH/profiles" ] && [ -d "$REPO_PATH/profiles.local" ] && [ -d "$REPO_PATH/.git" ]
+}
+
+directory_has_entries() {
+	local DIR="$1"
+	[ -d "$DIR" ] || return 1
+	python3 - "$DIR" <<'PY'
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+raise SystemExit(0 if any(directory.iterdir()) else 1)
+PY
+}
+
+target_repo_path() {
+	local LOCATION="$1" REPO_NAME="$2" RESOLVED_LOCATION BASE_NAME
+	RESOLVED_LOCATION="$(resolve_path "$LOCATION")"
+	BASE_NAME="$(basename "$RESOLVED_LOCATION")"
+	if [ "$BASE_NAME" = "$REPO_NAME" ]; then
+		echo "$RESOLVED_LOCATION"
+	else
+		echo "$RESOLVED_LOCATION/$REPO_NAME"
+	fi
+}
+
+init_repo_files() {
+	local REPO_PATH="$1"
+	mkdir -p "$REPO_PATH/profiles" "$REPO_PATH/profiles.local"
+	if [ ! -e "$REPO_PATH/.gitignore" ]; then
+		cat >"$REPO_PATH/.gitignore" <<'EOF'
+profiles.local/
+.DS_Store
+EOF
+	fi
+	if [ ! -e "$REPO_PATH/README.md" ]; then
+		cat >"$REPO_PATH/README.md" <<'EOF'
+# Agent Switcher Configs
+
+This repository stores shared agent profiles in `profiles/` and private machine-specific profiles in `profiles.local/`.
+EOF
+	fi
+}
+
+run_init() {
+	local LOCATION REPO_NAME REPO_PATH
+	printf "Agents repo location: "
+	if ! read -r LOCATION; then
+		echo "Cancelled. Missing repo location." >&2
+		exit 1
+	fi
+	printf "Repo/config name: "
+	if ! read -r REPO_NAME; then
+		echo "Cancelled. Missing repo name." >&2
+		exit 1
+	fi
+
+	[ -n "$LOCATION" ] || { echo "Repo location cannot be empty." >&2; exit 1; }
+	[ -n "$REPO_NAME" ] || { echo "Repo name cannot be empty." >&2; exit 1; }
+	case "$REPO_NAME" in
+		/*|*..*|*/*|*\\*)
+			echo "Repo name must be a simple directory name: $REPO_NAME" >&2
+			exit 1
+			;;
+	esac
+
+	REPO_PATH="$(target_repo_path "$LOCATION" "$REPO_NAME")"
+	if [ -e "$REPO_PATH" ] && [ ! -d "$REPO_PATH" ]; then
+		echo "Refusing to use non-directory path: $REPO_PATH" >&2
+		exit 1
+	fi
+	if directory_has_entries "$REPO_PATH" && ! is_compatible_repo "$REPO_PATH"; then
+		echo "Refusing to overwrite non-empty directory: $REPO_PATH" >&2
+		echo "Use an empty directory or an initialized agent-switcher repo with profiles/, profiles.local/, and .git/." >&2
+		exit 1
+	fi
+
+	mkdir -p "$REPO_PATH"
+	init_repo_files "$REPO_PATH"
+	git -C "$REPO_PATH" init >/dev/null
+	write_config_repo_path "$REPO_PATH"
+
+	echo "Initialized agent-switcher repo: $REPO_PATH"
+	echo "Wrote config: $CONFIG_PATH"
+	echo "Next commands:"
+	echo "  agent-switcher sync --profile <profile> --agent <agent>"
+	echo "  agent-switcher switch --profile <profile> --agent <agent>"
+}
+
+parse_profile_agent() {
+	PROFILE=""
+	AGENT=""
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--profile)
+				[ "$#" -ge 2 ] || { echo "Missing profile name after --profile" >&2; exit 1; }
+				PROFILE="$2"
+				shift 2
+				;;
+			--profile=*)
+				PROFILE="${1#--profile=}"
+				shift
+				;;
+			--agent)
+				[ "$#" -ge 2 ] || { echo "Missing agent name after --agent" >&2; exit 1; }
+				AGENT="$2"
+				shift 2
+				;;
+			--agent=*)
+				AGENT="${1#--agent=}"
+				shift
+				;;
+			-h|--help)
+				usage
+				exit 0
+				;;
+			*)
+				echo "Unknown option: $1" >&2
+				usage
+				exit 1
+				;;
+		esac
+	done
+	[ -n "$PROFILE" ] || { echo "Missing required --profile." >&2; usage; exit 1; }
+	[ -n "$AGENT" ] || { echo "Missing required --agent." >&2; usage; exit 1; }
+}
+
+run_setup_with_repo() {
+	local REPO_PATH="$1"
+	shift
+	[ -d "$REPO_PATH" ] || { echo "Configured repo path does not exist: $REPO_PATH" >&2; exit 1; }
+	[ -x "$SETUP_SH" ] || [ -f "$SETUP_SH" ] || { echo "Missing setup.sh beside agent-switcher executable: $SETUP_SH" >&2; exit 1; }
+	AGENT_SWITCHER_REPO="$REPO_PATH" bash "$SETUP_SH" "$@"
+}
+
+COMMAND="${1:-}"
+case "$COMMAND" in
+	init)
+		shift
+		[ "$#" -eq 0 ] || { usage; exit 1; }
+		run_init
+		;;
+	sync)
+		shift
+		parse_profile_agent "$@"
+		run_setup_with_repo "$(read_config_repo_path)" --env "$PROFILE" "$AGENT"
+		;;
+	switch)
+		shift
+		parse_profile_agent "$@"
+		run_setup_with_repo "$(read_config_repo_path)" switch --profile "$PROFILE" --agent "$AGENT"
+		;;
+	-h|--help)
+		usage
+		;;
+	*)
+		usage
+		exit 1
+		;;
+esac

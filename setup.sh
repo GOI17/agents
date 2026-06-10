@@ -36,7 +36,8 @@ USAGE
 
 echo "Setting up Agents configurations..."
 
-SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${AGENT_SWITCHER_REPO:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
+SCRIPT_PATH="$(cd -- "$SCRIPT_PATH" && pwd)"
 CONFIG_DIR="$HOME/.config"
 ENVIRONMENT="${AGENTS_PROFILE:-${AGENTS_ENV:-}}"
 PROFILE_DIR_NAME="profiles"
